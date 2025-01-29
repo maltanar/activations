@@ -53,29 +53,99 @@ SUPPORTED_MONOTONIC_ACTIVATIONS = {
     "Sign"
 }
 
+# Supported monotonic elementwise functions for fusing operations into
+# thresholds
+SUPPORTED_MONOTONIC_ELTWISE = {
+    "Add", "Sub", "Mul", "Div",  # TODO: More to add?
+}
 
-# Matches graph pattern of monotonic activation function followed by quantizer
-def match_quant_monotonic_activation(node: NodeProto, model: ModelWrapper):
-    # The node optype must be one of the supported activations specified above
-    if node.op_type in SUPPORTED_MONOTONIC_ACTIVATIONS:
-        # Now get the list of successor node and make sure there is exactly one
-        if len(successors := model.find_direct_successors(node)) == 1:
-            # If this is a quantizer, the node is part of a quantized monotonic
-            # activation
-            # TODO: Add BipolarQuant currently still missing full RA support
-            if successors[0].op_type in {"Quant"}:
-                # Return the two nodes of the pattern: The activation function
-                # and the following quantizer
-                return node, successors[0]
-    # A standalone quantizer can be interpreted as a quantized activation
-    # function as well, implicitly preceded by Identity
-    # TODO: Add BipolarQuant currently still missing full RA support
-    if node.op_type in {"Quant"}:
-        # Return only the quantizer node and mark the activation function as
-        # missing
-        return None, node
-    # Optype or number of successors did not match
-    return None, None
+# Supported types of quantization operations
+SUPPORTED_QUANTIZERS = {
+    "Quant",  # TODO: BipolarQuant and MultiThreshold from QONNX, QuantizeLinear
+}
+
+# Set of operator types which could be fused into quantizers while converting to
+# multi-thresholds
+FUSIBLE_OPS = {
+    *SUPPORTED_QUANTIZERS,
+    *SUPPORTED_MONOTONIC_ACTIVATIONS,
+    *SUPPORTED_MONOTONIC_ELTWISE
+}
+
+
+# Extracts the complete subgraph chain of fusible elementwise operations
+# leading up to a quantizer
+def extract_quant_fusible_subgraph(node: NodeProto, model: ModelWrapper):
+    # Checks whether an operation can be fused into the quantization operation
+    # when converting to thresholds
+    def is_fusible(n: NodeProto):
+        # Reject the first node of the graph for now... enable later...
+        if not model.find_direct_predecessors(n):
+            return False
+        # Overall the subgraph must produce the same shape as it consumes at the
+        # input as the single fused operator will not reshape or broadcast, thus
+        # we should not include such operations for now
+        if (model.get_tensor_shape(n.input[0]) != model.get_tensor_shape(
+                node.output[0])):
+            return False
+        # We can fuse quantizer into quantizers, monotonic activations and
+        # monotonic elementwise operations
+        if n.op_type in FUSIBLE_OPS:
+            # We cannot fuse branching topologies for now...
+            return not (model.is_join_node(n) or model.is_fork_node(n))
+        # Cannot fuse this operator...
+        return False
+
+    # We must start on some supported quantization operation
+    if node.op_type in SUPPORTED_QUANTIZERS:
+        # We already know the quantizer has one actual, i.e., non-parameter,
+        # input for which we want to track the producer chain
+        quant_inp = node.input[0]
+        # Track the producer chain upwards collecting all operators up until
+        # including the first not-fusible, keep_if_not_found to include the
+        # global input as well, i.e., when the condition is never fulfilled.
+        subgraph = model.find_upstream(
+            quant_inp, lambda x: not is_fusible(x), keep_if_not_found=True
+        )
+        # There might be no suitable nodes at all...
+        if not subgraph:
+            return []
+        # Decompose the subgraph to do additional checks on the first operator
+        *chain, first = subgraph
+        # Return the operator chain extended by the anchoring quantizer and
+        # reverse for in-order traversal when simulating
+        return reversed([node, *chain, *([first] if is_fusible(first) else [])])
+    # Return empty subgraph, nothing to do here...
+    return []
+
+
+# Executes a subgraph given as a list (chain, i.e., non-branching) of onnx nodes
+def evaluate_subgraph(subgraph: list[NodeProto], model: ModelWrapper, x):
+    # Creates a tensor according to the value info
+    def tensor_placeholder(name):
+        # If the tensor has some initializer fill with constant parameter
+        if (init := model.get_initializer(name)) is not None:
+            return init
+        # If there is no initializers we need some placeholder for dynamic
+        # inputs and outputs
+        return valueinfo_to_tensor(model.get_tensor_valueinfo(name))
+
+    # Names of all tensors produced or consumed by any operation in the subgraph
+    tensors = set([x for node in subgraph for x in [*node.input, *node.output]])
+    # Prepare the execution context with placeholder for all tensors relevant to
+    # the subgraph
+    ctx = {**{name: tensor_placeholder(name) for name in tensors}}  # noqa: dict
+    # Insert the input to the subgraph which must be the first input to the
+    # first operator
+    ctx[subgraph[0].input[0]] = x
+
+    # Execute all nodes in the subgraph in order, updating the execution context
+    # after each step
+    for node in subgraph:
+        execute_node(node, ctx, model.graph)
+
+    # Extract the final output from the execution context
+    return ctx[subgraph[-1].output[0]]
 
 
 # Converts supported quantized activation functions to MultiThreshold
@@ -135,53 +205,30 @@ class QuantActivationToMultiThreshold(Transformation):
             do_cleanup=True,
         )
 
-        # Creates a tensor according to the value info
-        def output_placeholder(name):
-            return valueinfo_to_tensor(model.get_tensor_valueinfo(name))
-
         # Get the model graph out of the model wrapper object
         graph = model.graph
         # Keep track of whether the graph has been modified
         graph_modified = False
         # Iterate all nodes in the graph keeping track of the index
-        for index, node in enumerate(graph.node):
-            # Try to match any quantized monotonic activation function for
-            # conversion
-            act, quant = match_quant_monotonic_activation(node, model)
+        # Note: Reversed as we are anchoring at the final quantizer of a fusible
+        # monotonic-activation-eltwise-quantizer chain extending upwards
+        for index, node in enumerate(reversed(graph.node)):
+            # Try to match a convertible subgraph of quantizers, activations and
+            # monotonic operations
+            subgraph = list(extract_quant_fusible_subgraph(node, model))
             # Skip if no quantizer is present
-            if quant is None:
+            if not subgraph:
                 # Softly skip without warning, transformation just does not
                 # apply here
                 continue
-            # Name of the input and output tensor of the quantized activation
-            inp, out = None if act is None else act.input[0], quant.output[0]
-            # If no separate activation function is given, get the input tensor
-            # from the quantizer node as well
-            inp = quant.input[0] if inp is None else inp
+            # Name of the input and output tensor of the whole chain of
+            # quantized operations
+            inp, out = subgraph[0].input[0], subgraph[-1].output[0]
 
             # Create a wrapper function for evaluating the quantized activation
             # subgraph handling context construction and output extraction
             def f(x):  # noqa: Shadows x from below, is ok
-                # Collect the input and output tensors of the subgraph
-                inputs = [*([] if act is None else act.input), *quant.input]
-                outputs = [*([] if act is None else act.output), *quant.output]
-                # Prepare execution context for executing the subgraph nodes
-                ctx = {
-                    # Prepare the inputs potentially from initializers
-                    **{i: model.get_initializer(i) for i in inputs},
-                    # Prepare the outputs by placeholders
-                    **{o: output_placeholder(o) for o in outputs},
-                    # Insert the input into the execution context
-                    inp: x
-                }
-                # If present, execute the activation function putting its
-                # results back into the context
-                if act is not None:
-                    execute_node(act, ctx, model.graph)
-                # Now execute the quantizer, which is always present
-                execute_node(quant, ctx, model.graph)
-                # Extract the output from the execution context
-                return ctx[out]
+                return evaluate_subgraph(subgraph, model, x)
 
             # The input and output to the activation-quantizer combination must
             # be described by the range information analyzed above to be able to
@@ -267,6 +314,9 @@ class QuantActivationToMultiThreshold(Transformation):
                     # clip values at the maximum of the range per dimension
                     level = np.where(level >= y1, y1, level + 1)
 
+                # Get the quantizer node terminating the chain of operators as
+                # this holds some extra information such as the target bit-width
+                quant = subgraph[-1]
                 # Get the output bit-with to be produced by the quantizer,
                 # which determines how many thresholds are needed
                 # TODO: Add BipolarQuant currently still missing full RA
@@ -324,7 +374,7 @@ class QuantActivationToMultiThreshold(Transformation):
                 #  thresholds, <= would always yield the smallest, i.e., min, x
                 #  for the corresponding output level y.
                 thresholds = np.min(
-                    thresholds, axis=tuple(range(thresholds.ndim-2))
+                    thresholds, axis=tuple(range(thresholds.ndim - 2))
                 )
 
                 # Create new value information for the thresholds tensor
@@ -421,11 +471,12 @@ class QuantActivationToMultiThreshold(Transformation):
                 graph.node.insert(index, multi_threshold)
                 graph.node.insert(index + 1, mul)
                 graph.node.insert(index + 2, add)
-                # Remove the optional activation function
-                if act is not None:
-                    graph.node.remove(act)
-                # Always remove the quantizer node
-                graph.node.remove(quant)
+
+                # Remove the subgraph originally representing the quantized
+                # chain of operators
+                for n in subgraph:
+                    graph.node.remove(n)
+
                 # The graph has been modified and thus the transformation
                 # needs to be applied again
                 graph_modified = True

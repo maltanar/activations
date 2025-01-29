@@ -17,8 +17,23 @@ from activations import act_quantizer, _registry
 from utils import seed
 
 
+# Generic PyTorch operator with template string describing the operation
+class OperatorTemplate(torch.nn.Module):
+    def __init__(self, template="x"):
+        # Initialize the PyTorch Module superclass
+        super().__init__()
+        # The template string to be filled at the forward pass
+        self.template = template
+
+    # Forward pass instantiating the template
+    def forward(self, x):  # noqa: Shadows x...
+        # Fill in all instances of x in this template and instantiate the code
+        # by evaluating this a some expression
+        return eval(self.template)
+
+
 # Constructs a dummy model for export
-def dummy(activation: str, input_bits: int, bits: int, **kwargs):
+def dummy(activation: str, input_bits: int, bits: int, pattern: str, **kwargs):
     # Create the dummy model as a sequence of input quantizer and quantized
     # activation function
     return torch.nn.Sequential(
@@ -28,6 +43,9 @@ def dummy(activation: str, input_bits: int, bits: int, **kwargs):
             # Note: ReLU needs to be unsigned as outputs are >= 0
             act_quant=act_quantizer(input_bits, _signed=True),
         ),
+        # Add some generic test-pattern template in front of the activation
+        # function: This should be a chain of fusible operations
+        OperatorTemplate(pattern),
         # Add the quantized activation functions as configured
         _registry[activation](bits, **kwargs)
     )
