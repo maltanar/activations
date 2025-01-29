@@ -43,6 +43,10 @@ stages:
       - build_steps.py
       - quant_activation_to_multithreshold.py
       - utils.py
+      # Implementation details of the new custom build steps
+      - custom/apply_config.py
+      - custom/composed_transformation.py
+      - custom/streamline.py
       # The model export produced by the setup stage: This triggers rerunning
       # this stage when the model configuration changes
       - model.onnx

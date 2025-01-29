@@ -36,7 +36,7 @@ build:
   # Target shell flow: 'vivado_zynq' or 'vitis_alveo'
   shell_flow_type: vivado_zynq
   # Path to folding configuration file
-  folding_config_file: folding.json
+  folding_config_file: folding.yaml
   # Path to layer implementation style specialization config
   specialize_layers_config_file: specialize_layers.json
   # Force the implementation of standalone thresholds to be able to use RTL

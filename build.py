@@ -4,11 +4,6 @@ import yaml
 # Numpy for handling arrays
 import numpy as np
 
-# QONNX handling of data layouts
-from qonnx.core.data_layout import (
-    get_channels_last_layout_for_ndims, get_channels_first_layout_for_ndims
-)
-
 # FINN dataflow builder
 import finn.builder.build_dataflow as build
 import finn.builder.build_dataflow_config as build_cfg
@@ -23,13 +18,16 @@ from utils import seed
 
 # Custom build steps for handling quantizer to multi-threshold conversion
 from build_steps import (
-    set_input_data_layouts,
-    step_lower_conv_and_batch_norm,
-    quant_activation_to_multithreshold,
+    prepare_graph,
     step_streamline,
     step_convert_elementwise_binary_to_hw,
+    step_convert_lookup_to_hw,
+    step_convert_split_concat_to_hw,
+    step_convert_depth_wise_to_hw,
     step_replicate_streams,
-    step_convert_split_to_hw
+    step_apply_folding_config,
+    node_by_node_cppsim,
+    node_by_node_rtlsim
 )
 
 # Script entrypoint
@@ -79,6 +77,8 @@ if __name__ == "__main__":
         verify_input_npy="inp.npy",
         # File with expected test outputs for verification
         verify_expected_output_npy="out.npy",
+        # Output full context dump for verification steps
+        verify_save_full_context=True,
         # Save the intermediate model graphs
         save_intermediate_models=True,
         # Avoid RTL simulation for setting the FIFO sizes
@@ -87,50 +87,47 @@ if __name__ == "__main__":
         auto_fifo_depths=True,
         # Build steps to execute
         steps=[
-            # Force the input data layout annotation
-            set_input_data_layouts([
-                get_channels_first_layout_for_ndims(len(params["shape"]) + 1)
-            ]),
-            # Lower Conv to MatMul and BatchNorm to affine parameters
-            # Note: Must be done explicitly this early as there is some weird
-            # behavior in the dynamic lowering of the range analysis pass
-            # somehow missing a scale factor.
-            step_lower_conv_and_batch_norm,
-            # Custom step to convert all suitable QONNX Quant nodes to
-            # Multithreshold nodes via range analysis
-            quant_activation_to_multithreshold(range_info),
-            # Convert all remaining QONNX Quant nodes not handled by the step
-            # before to Multithreshold nodes
-            # Note: These are input quantizers (due to missing int-range at the
-            # input) and BipolarQuant which are currently not fully supported by
-            # range analysis.
-            "step_qonnx_to_finn",
-            "step_tidy_up",
-            # Custom streamlining step to deal with composite activation
-            # functions
+            # Prepares the QONNX graph to be consumed by FINN: Cleanup, lowering
+            # and Quant to MultiThreshold conversion
+            prepare_graph(range_info=range_info),
+            # Unified exhaustive streamlining of complex model topologies
+            # including attention, residuals and splits
             step_streamline,
-            # Default streamlining step to trigger verification
-            "step_streamline",
-            # Convert elementwise binary operations to hardware to support
-            # composite activation functions
+            # Convert the elementwise binary operations to hardware operators.
+            # These include for example adding residual branches and positional
+            # encoding
             step_convert_elementwise_binary_to_hw,
-            # Convert the Split operator (e.g., in GLU) to a hardware custom
-            # operation
-            step_convert_split_to_hw,
-            # Convert forks to stream replication to support composite
-            # activation functions
+            # Convert Lookup layers, e.g., token embedding, to hardware custom
+            # operators
+            step_convert_lookup_to_hw,
+            # Convert Split and Concat operators to hardware, e.g., splits
+            # contained in the GLU activation
+            step_convert_split_concat_to_hw,
+            # Convert depth-wise convolution MatMuls to VVUs
+            step_convert_depth_wise_to_hw,
+            # Properly replicate the stream feeding the query, key and value
+            # projections
             step_replicate_streams,
-            # Continue with default FINN build flow from here on
+            # Convert most other layers supported by FINN to HW operators and
+            # continue with default FINN flow
             "step_convert_to_hw",
             "step_specialize_layers",
             "step_create_dataflow_partition",
             "step_target_fps_parallelization",
-            "step_apply_folding_config",
+            # Apply folding config using out custom YAML format
+            step_apply_folding_config,
             "step_minimize_bit_width",
             "step_generate_estimate_reports",
             "step_hw_codegen",
             "step_hw_ipgen",
             "step_set_fifo_depths",
+            # Run additional node-by-node verification in C++ simulation of the
+            # model before creating the stitched IP
+            node_by_node_cppsim,
+            # Run additional node-by-node verification in RTL simulation of the
+            # model before creating the stitched IP
+            node_by_node_rtlsim,
+            # Finish following default FINN flow
             "step_create_stitched_ip",
             "step_measure_rtlsim_performance",
             "step_out_of_context_synthesis",

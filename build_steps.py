@@ -1,435 +1,231 @@
 # Copies (deep-copies) python objects
 import copy
+# Numpy for loading and comparing the verification input/output
+import numpy as np
+# YAML for loading experiment configurations
+import yaml
+
 # QONNX wrapper of ONNX model graphs
 from qonnx.core.modelwrapper import ModelWrapper
-# If we have a convolution with a bias tensors input, QONNX and later FINN
-# expect the bias to be expressed as a standalone Add node following the Conv
-# node.
-from qonnx.transformation.extract_conv_bias import ExtractBiasFromConv
-# Collapses chains of constants into a single constant operation or even
-# initializer tensors.
-from qonnx.transformation.fold_constants import FoldConstants
+# Range information structure for seeding the range analysis for converting
+# quantized activations to MultiThreshold
+from qonnx.util.range_analysis import RangeInfo
+
 # QONNX graph transformations for renaming and cleaning up
 from qonnx.transformation.general import (
-    Transformation,
     GiveUniqueNodeNames,
     GiveReadableTensorNames,
-    ConvertDivToMul,
-    ConvertSubToAdd
+    GiveUniqueParameterTensors,
+    RemoveStaticGraphInputs,
+    RemoveUnusedTensors,
 )
 # QONNX graph transformations for annotating the graph with datatype and shape
 # information
 from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.transformation.infer_shapes import InferShapes
+
+# If we have a convolution with a bias tensors input, QONNX and later FINN
+# expect the bias to be expressed as a standalone Add node following the Conv
+# node.
+from qonnx.transformation.extract_conv_bias import ExtractBiasFromConv
+# Converts BatchNorm operation to affine transformation
+from qonnx.transformation.batchnorm_to_affine import BatchNormToAffine
+# Converts Gemm operation to MatMul with extracted standalone bias op
+from qonnx.transformation.gemm_to_matmul import GemmToMatMul
+# Converts Conv to Im2Col and MatMul with extracted standalone bias op
+from qonnx.transformation.lower_convs_to_matmul import LowerConvsToMatMul
+# Transposes the initializer tensors of a Quant node instead of having a
+# standalone Transpose following
+from qonnx.transformation.quant_constant_folding import (
+    FoldTransposeIntoQuantInit
+)
+# Collapses chains of constants into a single constant operation or even
+# initializer tensors.
+from qonnx.transformation.fold_constants import FoldConstants
+# Folds quantizers into weight tensor initializers, needed for lowering
+# convolutions to MatMuls
+from finn.transformation.qonnx.fold_quant_weights import FoldQuantWeights
+# FINN streamlining transformations absorbing tensors/nodes into others
+from finn.transformation.streamline.absorb import (
+    AbsorbSignBiasIntoMultiThreshold,
+)
+# FINN streamlining transformations removing nodes without real effect from the
+# graph
+from finn.transformation.streamline.remove import (
+    RemoveIdentityTranspose,
+    RemoveIdentityReshape
+)
+# Converts (infers) ONNX and QONNX nodes to FINN hardware CustomOps
+from finn.transformation.fpgadataflow.convert_to_hw_layers import (
+    InferElementwiseBinaryOperation,
+    InferSplitLayer,
+    InferConcatLayer,
+    InferLookupLayer,
+    InferVectorVectorActivation
+)
+# Converts fork-nodes to ReplicateStream hardware operator
+from finn.transformation.fpgadataflow.replicate_stream import (
+    InferReplicateStream
+)
+# Standard QONNX to FINN conversion function
+from finn.transformation.qonnx.convert_qonnx_to_finn import ConvertQONNXtoFINN
+from finn.transformation.qonnx.quant_act_to_multithreshold import (
+    default_filter_function_generator,
+)
+# QONNX quantization data types
+from qonnx.core.datatype import DataType
 # FINN dataflow builder configuration
 from finn.builder.build_dataflow_config import (
     VerificationStepType, DataflowBuildConfig
 )
 # FINN verification after build/graph transformation steps
 from finn.builder.build_dataflow_steps import verify_step
-from qonnx.transformation.lower_convs_to_matmul import LowerConvsToMatMul
-# Transposes the initializer tensors of a Quant node instead of having a
-# standalone Transpose following
-from qonnx.transformation.quant_constant_folding import \
-    FoldTransposeIntoQuantInit
-# Range information structure for seeding the range analysis for converting
-# quantized activations to MultiThreshold
-from qonnx.util.range_analysis import RangeInfo
 
-# Folds quantizers into weight tensor initializers, needed for lowering
-# convolutions to MatMuls
-from finn.transformation.qonnx.fold_quant_weights import FoldQuantWeights
+# Transformations preparing the operators for synthesis and simulation
+from finn.transformation.fpgadataflow.prepare_cppsim import PrepareCppSim
+from finn.transformation.fpgadataflow.compile_cppsim import CompileCppSim
+from finn.transformation.fpgadataflow.hlssynth_ip import HLSSynthIP
+from finn.transformation.fpgadataflow.prepare_ip import PrepareIP
+from finn.transformation.fpgadataflow.set_exec_mode import SetExecMode
+from finn.transformation.fpgadataflow.prepare_rtlsim import PrepareRTLSim
 
-# Converts quantized activation functions to MultiThresholds based on range
-# analysis
-from quant_activation_to_multithreshold import QuantActivationToMultiThreshold
+# Execute onnx model graphs from the dataflow parent for verification
+from finn.util.test import execute_parent
+
+# Custom transformation for exhaustively composing transformations
+from custom.composed_transformation import ComposedTransformation
+# # Custom conversion from Quant to MultiThreshold
+from quant_activation_to_multithreshold import (
+    QuantActivationToMultiThreshold
+)
+# Custom st of streamlining transformations
+from custom.streamline import Streamline, MoveMulPastAdd
 
 
-# Sets the data layout of the model input tensors
-def set_input_data_layouts(layouts: list[str]):
+# Prepares the graph to be consumed by FINN:
+# 1. Some graph cleanup removing unused tensors, nodes without effect and
+#  folding constants, i.e., collapsing chains of operations on constant tensors
+# 2. Lowers some "more complex" operations: converts Conv and Gemm to MatMul and
+#  BatchNorm to Mul and Add operations followed by some necessary cleanup
+# 3. Converts all QONNX Quant nodes to MultiThreshold operations which can
+#  absorb scales and biases during streamlining
+def prepare_graph(range_info: RangeInfo):
     # Wrap the actual transformation/build step function
-    def step_set_input_data_layouts(
-            model: ModelWrapper, _: DataflowBuildConfig
-    ):
-        # Run over all graph inputs joined to the layout annotations given as
-        # parameter
-        for inp, layout in zip(model.graph.input, layouts):
-            # Set the layout annotation
-            model.set_tensor_layout(inp.name, list(layout))
-        # Return the transformed model
-        return model
-
-    # Return the wrapped build step function
-    return step_set_input_data_layouts
-
-
-
-# Lowering transformations converting Conv to MatMul, BatchNorm to affine, etc.
-def step_lower_conv_and_batch_norm(model: ModelWrapper, _: DataflowBuildConfig):
-    # Compose all the lowering transformations
-    return model.transform(ComposedTransformation([
-        # Annotate the graph with shape and data type information
-        InferShapes(),
-        InferDataTypes(),
-        # Moves the bias input to the Conv operator as a separate Add node
-        # behind the Conv node
-        ExtractBiasFromConv(),
-        # Need to do some constant and weight folding first
-        FoldConstants(),
-        FoldTransposeIntoQuantInit(),
-        FoldQuantWeights(),
-        # Annotate the graph with shape and data type information
-        InferShapes(),
-        InferDataTypes(),
-        # # Converts Conv layers to MatMul
-        LowerConvsToMatMul(),
-        # Converts BatchNorm to affine scale and bias
-        BatchNormToAffine(),
-    ]))
-
-
-# Converts quantized activation functions to MultiThreshold instances based on
-# range analysis. Also does various cleanup and lowering transformations as part
-# of the range analysis.
-def quant_activation_to_multithreshold(range_info: RangeInfo):
-    # Wrap the actual transformation/build step function
-    def step_quant_activation_to_multithreshold(
-            model: ModelWrapper, cfg: DataflowBuildConfig
-    ):
-        # Add shape and datatype annotations throughout all the graph
-        model = model.transform(InferDataTypes())
-        model = model.transform(InferShapes())
-
-        # Convert all suitable quantized activation functions to MultiThresholds
-        model = model.transform(QuantActivationToMultiThreshold(range_info))
-
-        # If configured, run a verification of the transformed model on some sample
-        # inputs
+    def step_prepare_graph(model: ModelWrapper, cfg: DataflowBuildConfig):
+        # Exhaustively apply the set of cleanup transformations
+        model = model.transform(ComposedTransformation([
+            # Adds shape and datatype annotations to all tensors in this graph
+            InferDataTypes(),
+            InferShapes(),
+            # Cleanup the graph by removing redundant, unnecessary and constant
+            # nodes and tensors and give unique names to everything remaining
+            GiveUniqueNodeNames(),
+            GiveReadableTensorNames(),
+            RemoveStaticGraphInputs(),
+            RemoveUnusedTensors(),
+            GiveUniqueParameterTensors(),
+            FoldConstants(),
+            # Remove unnecessary shape and layout transformations
+            RemoveIdentityReshape(),
+            RemoveIdentityTranspose(),
+            # Redo shape and datatype annotations after removing nodes and
+            # tensors
+            InferShapes(),
+            InferDataTypes(),
+        ]))
+        # If configured, run a verification of the transformed model on some
+        # sample inputs
+        if (VerificationStepType.TIDY_UP_PYTHON in
+                cfg._resolve_verification_steps()):  # noqa
+            verify_step(
+                model, cfg, "tidied_up_python", need_parent=False
+            )
+        # Exhaustively apply the lowering transformations
+        model = model.transform(ComposedTransformation([
+            # Moves the bias input to the Conv operator as a separate Add node
+            # behind the Conv node
+            ExtractBiasFromConv(),
+            # Converts Gemm nodes to MatMul (+ bias)
+            GemmToMatMul(),
+            # Need to do some constant and weight folding first
+            FoldConstants(),
+            FoldTransposeIntoQuantInit(),
+            FoldQuantWeights(),
+            # Annotate the graph with shape and data type information
+            InferShapes(),
+            InferDataTypes(),
+            # Converts Conv layers to MatMul
+            LowerConvsToMatMul(),
+            # Converts BatchNorm to affine scale and bias
+            BatchNormToAffine(),
+            # Annotate the graph with shape and data type information
+            InferShapes(),
+            InferDataTypes(),
+        ]))
+        # If configured, run a verification of the transformed model on some
+        # sample inputs
         if (VerificationStepType.QONNX_TO_FINN_PYTHON in
                 cfg._resolve_verification_steps()):  # noqa
             verify_step(
-                model, cfg, "to_multithreshold_python", need_parent=False
+                model, cfg, "lowered_python", need_parent=False
             )
-
+        # Apply the quantizer to MultiThreshold conversion
+        # Note: This is exhaustive as well as single .transform reapplies as
+        # long as possible.
+        model = model.transform(QuantActivationToMultiThreshold(range_info))
+        # If configured, run a verification of the transformed model on some
+        # sample inputs
+        if (VerificationStepType.QONNX_TO_FINN_PYTHON in
+                cfg._resolve_verification_steps()):  # noqa
+            verify_step(
+                model, cfg, "quant_to_thresholds_ra_python", need_parent=False
+            )
+        # Apply the standard QONNX to FINN conversion step to convert the
+        # remaining quantizers not yet covered by the new range analysis based
+        # method
+        model = model.transform(ConvertQONNXtoFINN(
+            filter_function=default_filter_function_generator(
+                max_multithreshold_bit_width=cfg.max_multithreshold_bit_width
+            )
+        ))
+        # If configured, run a verification of the transformed model on some
+        # sample inputs
+        if (VerificationStepType.QONNX_TO_FINN_PYTHON in
+                cfg._resolve_verification_steps()):  # noqa
+            verify_step(
+                model, cfg, "prepared_graph_python", need_parent=False
+            )
         # Return the transformed model
         return model
 
-    # Return the wrapped build step function
-    return step_quant_activation_to_multithreshold
+    # Return the wrapped transformation step function
+    return step_prepare_graph
 
 
-# QONNX cleanup transformations
-from qonnx.transformation.remove import RemoveIdentityOps
-# Converts BatchNorm operation to affine transformation
-from qonnx.transformation.batchnorm_to_affine import BatchNormToAffine
-# Streamlining transformation: This is a collection of various transformations
-from finn.transformation.streamline import (
-    ConvertSignToThres, RoundAndClipThresholds
-)
-# Fuse/Absorb operations
-from finn.transformation.streamline.absorb import (
-    AbsorbAddIntoMultiThreshold,
-    AbsorbSignBiasIntoMultiThreshold,
-    FactorOutMulSignMagnitude,
-    AbsorbMulIntoMultiThreshold,
-    Absorb1BitMulIntoMatMul,
-    Absorb1BitMulIntoConv
-)
-# Reorder operations
-from finn.transformation.streamline.reorder import (
-    MoveMulPastFork,
-    MoveScalarLinearPastInvariants,
-    MoveMulPastMaxPool,
-    MoveAddPastMul,
-    MoveScalarAddPastMatMul,
-    MoveAddPastConv,
-    MoveScalarMulPastMatMul,
-    MoveScalarMulPastConv,
-    MoveScalarLinearPastSplit,
-    MoveTransposePastSplit
-)
-# Collapse consecutive operations of the same type
-from finn.transformation.streamline.collapse_repeated import (
-    CollapseRepeatedMul,
-    CollapseRepeatedAdd
-)
-# FINN transformation converting ONNX nodes to hardware custom operators
-from finn.transformation.fpgadataflow.convert_to_hw_layers import (
-    InferElementwiseBinaryOperation, InferSplitLayer
-)
-# Stream replication for outputs with multiple consumers
-from finn.transformation.fpgadataflow.replicate_stream import (
-    InferReplicateStream
-)
-
-
-# Composes graph transformations such that each individual transformation as
-# well as the whole sequence is applied exhaustively
-class ComposedTransformation(Transformation):
-    # Initializes the transformation given a list of transformations
-    def __init__(self, transformations: list[Transformation]):
-        # Initialize the transformation base class
-        super().__init__()
-        # Register the list of transformations to be applied in apply()
-        self.transformations = transformations
-
-    # Applies the transform to a whole model graph
-    def apply(self, model: ModelWrapper):  # noqa
-        # Keep track of whether the graph has been modified
-        graph_modified = False
-        # Iterate all transformations to be applied
-        for transformation in self.transformations:
-            # Start each transformation on a deep copy of the model to mimic the
-            # behavior of ModelWrapper.transform()
-            model = copy.deepcopy(model)
-            # Exhaustively apply the transformation until it no longer modifies
-            # the graph
-            while True:
-                # Apply the transformation once, reporting back whether any node
-                # or pattern has been modified
-                model, _graph_modified = transformation.apply(model)
-                # Keep track whether the graph has been modified at least once
-                graph_modified = graph_modified or _graph_modified
-                # Break the loop if this transformation did not change anything
-                if not _graph_modified:
-                    break
-            # Apply the cleanup transformations of the ModelWrapper
-            model.cleanup()
-            # Apply some further cleanup transformations to the model graph
-            # removing some clutter and keeping all names readable and ordered
-            # at any time
-            model = model.transform(RemoveIdentityOps())
-            model = model.transform(GiveUniqueNodeNames())
-            model = model.transform(GiveReadableTensorNames())
-            model = model.transform(InferDataTypes())
-        # Return the transformed model and indicate whether the graph actually
-        # has been transformed by at least one transformation so the whole
-        # sequence of transformations will be reapplied
-        return model, graph_modified
-
-
-# Moves constant elementwise multiplication past another joining multiplication
-class MoveConstMulPastJoinMul(Transformation):
-    # Applies the transform to a whole model graph
-    def apply(self, model: ModelWrapper):  # noqa
-        # Get the model graph out of the model wrapper object
-        graph = model.graph
-        # Keep track of whether the graph has been modified
-        graph_modified = False
-        # Iterate all nodes in the graph keeping track of the index
-        for index, node in enumerate(graph.node):
-            # Applies to Mul operation types
-            if node.op_type == "Mul":
-                # Currently does not handle fork- or join-nodes
-                if model.is_fork_node(node) or model.is_join_node(node):
-                    # Softly skip this node
-                    continue
-                # As this is not a fork-node, there can be at most one successor
-                successor = model.find_direct_successors(node)
-                # If Squeeze is the final operation in the graph, there might
-                # be no successor
-                if successor is None:
-                    # Softly skip this node
-                    continue
-                # Now there is exactly one successor which needs to be extracted
-                # from the list
-                successor = successor[0]
-                # Applies to Multiplications
-                if successor.op_type in {"Mul"}:
-                    # Applies only if the second multiplication is a join-node
-                    if model.is_join_node(successor):
-                        # Get names of all tensors involved in connecting the
-                        # nodes
-                        inp = node.input[0]  # noqa: Duplicate
-                        mid = node.output[0]
-                        out = successor.output[0]
-                        # Need to match the correct input of the joining second
-                        # multiplication
-                        for i, name in enumerate(successor.input):
-                            # If the successors input currently matches the
-                            # intermediate tensors, this input needs to be
-                            # rewired
-                            if name == mid:
-                                # Rewire the graph to feed original into the
-                                # second Mul node first
-                                successor.input[i] = inp
-                                # Note: Do not break here as it is perfectly
-                                # legal to connect the same tensor multiple
-                                # times to different inputs
-                        # Repurpose the middle tensor for the output of the
-                        # second Mul
-                        successor.output[0] = mid
-                        # The first Mul operator now gets the middle tensor as
-                        # its input
-                        node.input[0] = mid
-                        # The first Mul now produces the original output tensor
-                        node.output[0] = out
-                        # Delete the shape annotation of the connecting tensors
-                        # to be re-done later
-                        model.set_tensor_shape(mid, None)
-                        model.set_tensor_shape(out, None)
-                        # Track whether the graph has been modified, never
-                        # resets to False
-                        graph_modified = True
-                        # Break the loop after deleting shape annotations to
-                        # immediately re-do these before changing the next
-                        # operator
-                        break
-        # Redo datatype and shape annotations
-        model = model.transform(InferShapes())
-        model = model.transform(InferDataTypes())
-        # Return the transformed model and indicate whether the transformation
-        # needs to be applied again
-        return model, graph_modified
-
-
-# Groups node inputs by dynamic vs. initializer category
-from finn.transformation.streamline.absorb import group_inputs_by_category
-
-
-# Moves elementwise multiplication past elementwise addition if one input to
-# each of the operators is a known constant
-# Note: Reverse of MoveAddPastMul
-class MoveMulPastAdd(Transformation):
-    # Applies the transform to a whole model graph
-    def apply(self, model: ModelWrapper):  # noqa
-        # Get the model graph out of the model wrapper object
-        graph = model.graph
-        # Keep track of whether the graph has been modified
-        graph_modified = False
-        # Iterate all nodes in the graph keeping track of the index
-        for index, node in enumerate(graph.node):
-            # Applies to Mul operation types
-            if node.op_type == "Mul":
-                # Currently does not handle fork- or join-nodes
-                if model.is_fork_node(node) or model.is_join_node(node):
-                    # Softly skip this node
-                    continue
-                # As this is not a fork-node, there can be at most one successor
-                successor = model.find_direct_successors(node)
-                # If Squeeze is the final operation in the graph, there might
-                # be no successor
-                if successor is None:
-                    # Softly skip this node
-                    continue
-                # Now there is exactly one successor which needs to be extracted
-                # from the list
-                successor = successor[0]
-                # Applies to additions
-                if successor.op_type in {"Add"}:
-                    # The addition may not join as we need to know the second
-                    # input
-                    if not model.is_join_node(successor):
-                        # Get the constant initializer tensors for both
-                        # operations: y = s * x + b
-                        _, s_name = group_inputs_by_category(node, model)
-                        _, b_name = group_inputs_by_category(successor, model)
-                        # Skip if either node has no constant initializer
-                        if not s_name or not b_name:
-                            # Skip without warning ok?
-                            continue
-                        # There must be exactly one constant per operations
-                        assert len(s_name) == 1, \
-                            f"To many constant inputs for {node}"
-                        assert len(b_name) == 1, \
-                            f"To many constant inputs for {successor}"
-                        # Now read the initializer tensors
-                        s = model.get_initializer(*s_name)
-                        b = model.get_initializer(*b_name)
-                        # Update the addition initializer according to the
-                        # distributive law
-                        model.set_initializer(*b_name, b / s)
-                        # Get names of all tensors involved in connecting the
-                        # nodes
-                        inp = node.input[0]  # noqa: Duplicate
-                        mid = node.output[0]
-                        out = successor.output[0]
-                        # Rewire the graph to feed original input into the
-                        # Add node first
-                        successor.input[0] = inp
-                        # Repurpose the middle tensor for the output of the Add
-                        successor.output[0] = mid
-                        # The Mul operator now gets the middle tensor as its
-                        # input
-                        node.input[0] = mid
-                        # Mul now produces the original output tensor
-                        node.output[0] = out
-                        # Delete the shape annotation of the connecting tensors
-                        # to be re-done later
-                        model.set_tensor_shape(mid, None)
-                        model.set_tensor_shape(out, None)
-                        # Track whether the graph has been modified, never
-                        # resets to False
-                        graph_modified = True
-                        # Break the loop after deleting shape annotations to
-                        # immediately re-do these before changing the next
-                        # operator
-                        break
-        # Redo datatype and shape annotations
-        model = model.transform(InferShapes())
-        model = model.transform(InferDataTypes())
-        # Return the transformed model and indicate whether the transformation
-        # needs to be applied again
-        return model, graph_modified
-
-
-# Custom streamlining step to deal with composite activation functions
-def step_streamline(model: ModelWrapper, _: DataflowBuildConfig):
-    # Compose streamlining transformations similar to the default streamlining
-    # transformation but applied more exhaustively.
-    return model.transform(
-        ComposedTransformation([
-            # Default FINN Streamlining transformations (except rounding and
-            # clipping of thresholds) followed by some custom Mul-moving
-            # transformations.
-            ComposedTransformation([
-                ConvertSubToAdd(),
-                ConvertDivToMul(),
-                BatchNormToAffine(),
-                ConvertSignToThres(),
-                MoveMulPastMaxPool(),
-                AbsorbSignBiasIntoMultiThreshold(),
-                MoveScalarLinearPastInvariants(),
-                MoveAddPastMul(),
-                MoveScalarAddPastMatMul(),
-                MoveAddPastConv(),
-                MoveScalarMulPastMatMul(),
-                MoveScalarMulPastConv(),
-                MoveAddPastMul(),
-                CollapseRepeatedAdd(),
-                CollapseRepeatedMul(),
-                MoveMulPastMaxPool(),
-                AbsorbAddIntoMultiThreshold(),
-                FactorOutMulSignMagnitude(),
-                AbsorbMulIntoMultiThreshold(),
-                Absorb1BitMulIntoMatMul(),
-                Absorb1BitMulIntoConv(),
-                # Move around Mul operations to get Muls and Adds into a better
-                # place for absorbing into MultiThresholds in the next round of
-                # streamlining starting from the top.
-                # TODO: Maybe move these three to the top of the streamlining
-                #  composition, as the primary intention is to re-absorb some
-                #  biases back into MultiThresholds which should probably happen
-                #  rather early on after export and conversion?
-                MoveMulPastFork(),
-                # Note: This brings constant Muls (i.e., quantizer scales to be
-                # removed) forward through joining Muls (i.e., those ending up
-                # as actual hardware operators).
-                MoveConstMulPastJoinMul(),
-                # Note: This is essential to allow some Add operations to be
-                # absorbed by the next round's AbsorbSignBiasIntoMultiThreshold
-                MoveMulPastAdd(),
-                # Streamlining for Split operations
-                # TODO: Add Concat streamlining here as well
-                MoveScalarLinearPastSplit(),
-                MoveTransposePastSplit()
-            ]),
-            # Only round and clip after all streamlining transformations have
-            # been applied exhaustively.
-            # Note: Might still enable another round of streamlining.
-            RoundAndClipThresholds(),
-        ])
-    )
+# Applies the custom set of exhaustive streamlining transformations, also taking
+# special topology like attention, residuals, splits and transposes into account
+def step_streamline(model: ModelWrapper, cfg: DataflowBuildConfig):
+    # These should not be applied exhaustively with the other streamlining
+    # transformations to not end up in cycles.
+    # Note: This is essential to allow some Add operations to be
+    # absorbed by the next round's AbsorbSignBiasIntoMultiThreshold
+    model = model.transform(MoveMulPastAdd())
+    model = model.transform(AbsorbSignBiasIntoMultiThreshold())
+    # Exhaustively apply the following set of transformations to streamline the
+    # graph with the overall goal of collecting scales and biases in front of
+    # MultiThreshold operations or, alternatively, at the end of the graph.
+    # Note: Contains some sets of nested exhaustive transformations meant for
+    # particular architectural patterns, e.g., residual topologies.
+    model = model.transform(Streamline())
+    # If configured, run a verification of the transformed model on some
+    # sample inputs
+    if (VerificationStepType.STREAMLINED_PYTHON in
+            cfg._resolve_verification_steps()):  # noqa
+        verify_step(
+            model, cfg, "streamlined_python", need_parent=False
+        )
+    # Return the transformed model
+    return model
 
 
 # Function running the transformations to convert elementwise binary operations
@@ -438,8 +234,37 @@ def step_convert_elementwise_binary_to_hw(model: ModelWrapper, _):
     # Convert elementwise operations to hardware operators
     #   Note: Do not convert the final Mul operator at the output
     return model.transform(InferElementwiseBinaryOperation(
-        InferElementwiseBinaryOperation.reject_floats
+        InferElementwiseBinaryOperation.reject_output_dequant
     ))
+
+
+# Converts Split and Concat operations to hardware custom operators
+def step_convert_split_concat_to_hw(model: ModelWrapper, _):
+    return model.transform(InferSplitLayer()).transform(InferConcatLayer())
+
+
+# Function running the transformations to convert Gather, i.e., index lookup,
+# nodes to their hardware implementations
+def step_convert_lookup_to_hw(model: ModelWrapper, _):
+    # Iterate all nodes in the graph keeping track of the index
+    for index, node in enumerate(model.graph.node):
+        # If this is a Gather node, force the input (index) type annotation
+        if node.op_type == "Gather":
+            # Force to unsigned 64-bit integer for now
+            model.set_tensor_datatype(node.input[1], DataType["UINT64"])
+            # Get the value info for the input tensor to have access to the ONNX
+            # datatype of the tensor
+            value_info = model.get_tensor_valueinfo(node.input[1])
+            # Force the container datatype of the input to be a float
+            value_info.type.tensor_type.elem_type = 1
+    # Convert Gather to Lookup layers
+    return model.transform(InferLookupLayer())
+
+
+# Converts depth-wise convolution to hardware operator calling the
+# InferVectorVectorActivation transformation
+def step_convert_depth_wise_to_hw(model: ModelWrapper, _: DataflowBuildConfig):
+    return model.transform(InferVectorVectorActivation())
 
 
 # Function running the InferReplicateStream transformation
@@ -448,6 +273,128 @@ def step_replicate_streams(model: ModelWrapper, _):
     return model.transform(InferReplicateStream())
 
 
-# Function converting the Split operator to hardware custom operation
-def step_convert_split_to_hw(model: ModelWrapper, _):
-    return model.transform(InferSplitLayer())
+# Transformation apply the new YAML-based configuration to the model
+from custom.apply_config import ApplyConfig
+
+# Custom step applying our custom format of folding configuration to the graph
+def step_apply_folding_config(model: ModelWrapper, cfg: DataflowBuildConfig):
+    # Only applies if a configuration file is given
+    if cfg.folding_config_file is not None:
+        # Load the configuration dictionary form YAML file
+        with (open(cfg.folding_config_file, "r") as file):
+            # Load YAML string
+            config = yaml.safe_load(file)
+            # Assign unique names to the nodes which can be matched by
+            # individual per-node configuration options
+            model = model.transform(GiveUniqueNodeNames())
+            # Apply the configuration dictionary to the model graph
+            model = model.transform(ApplyConfig(config))
+    # If configured, run a verification of the transformed model on some sample
+    # inputs
+    if (VerificationStepType.FOLDED_HLS_CPPSIM in
+            cfg._resolve_verification_steps()):  # noqa
+        # Prepare C++ Simulation for verification
+        model = model.transform(PrepareCppSim())
+        model = model.transform(CompileCppSim())
+        model = model.transform(SetExecMode("cppsim"))
+        # Execute a verification step of the model with inputs specified in
+        # build configuration
+        verify_step(model, cfg, "folded_hls_cppsim", need_parent=True)
+
+    # Return model with configuration applied
+    return model
+
+
+# Runs a node-by-node C++ simulation of the model saving the fill execution
+# context
+def node_by_node_cppsim(model: ModelWrapper, cfg: DataflowBuildConfig):
+    # Save the original model
+    original = model
+    # Copy the model
+    model = copy.deepcopy(model)
+    # Set model execution mode to C++ simulation
+    model = model.transform(SetExecMode("cppsim"))
+    # Generates the C++ source and compiles the C++ simulation
+    model = model.transform(GiveUniqueNodeNames())
+    model = model.transform(PrepareCppSim())
+    model = model.transform(CompileCppSim())
+
+    # Load the verification input/output pair
+    inp = np.load(cfg.verify_input_npy)  # noqa
+    out = np.load(cfg.verify_expected_output_npy)
+
+    # Path to the parent model wrapping the streaming dataflow partition and the
+    # wrapped child model, i.e., the inside of the streaming dataflow partition
+    parent = f"{cfg.output_dir}/intermediate_models/dataflow_parent.onnx"
+    child = f"{cfg.output_dir}/intermediate_models/verify_cppsim.onnx"
+    # Save the child model prepared for C++ simulation
+    model.save(child)
+    # Load the parent model to pass to verification execution
+    parent_model = ModelWrapper(parent)
+
+    # Reshape the input/output to match the model
+    inp = inp.reshape(parent_model.get_tensor_shape(model.graph.input[0].name))
+    out = out.reshape(parent_model.get_tensor_shape(model.graph.output[0].name))
+
+    # Execute the onnx model to collect the result
+    # context = execute_onnx(model, context, return_full_exec_context=True)
+    context = execute_parent(parent, child, inp, return_full_ctx=True)
+    # Extract the output tensor from the execution context
+    model_out = context[parent_model.graph.output[0].name]
+    # Compare input to output
+    result = {True: "SUCCESS", False: "FAIL"}[np.allclose(out, model_out)]
+    # Save the verification outputs into the configured build directory
+    verification_output = f"{cfg.output_dir}/verification_output/"
+    # Save the verification execution context
+    np.savez(f"{verification_output}/verify_cppsim_{result}.npz", **context)
+    # Return the original, unmodified model
+    return original
+
+
+# Runs a node-by-node RTL simulation of the model saving the fill execution
+# context
+def node_by_node_rtlsim(model: ModelWrapper, cfg: DataflowBuildConfig):
+    # Save the original model
+    original = model
+    # Copy the model
+    model = copy.deepcopy(model)
+    # Set model execution mode to RTL simulation
+    model = model.transform(SetExecMode("rtlsim"))
+    # Generates the C++ source and compiles the RTL simulation
+    model = model.transform(GiveUniqueNodeNames())
+    model = model.transform(PrepareIP(
+        cfg._resolve_fpga_part(), cfg.synth_clk_period_ns)  # noqa
+    )
+    model = model.transform(HLSSynthIP())
+    model = model.transform(PrepareRTLSim())
+
+    # Load the verification input/output pair
+    inp = np.load(cfg.verify_input_npy)  # noqa
+    out = np.load(cfg.verify_expected_output_npy)
+
+    # Path to the parent model wrapping the streaming dataflow partition and the
+    # wrapped child model, i.e., the inside of the streaming dataflow partition
+    parent = f"{cfg.output_dir}/intermediate_models/dataflow_parent.onnx"
+    child = f"{cfg.output_dir}/intermediate_models/verify_rtlsim.onnx"
+    # Save the child model prepared for RTL simulation
+    model.save(child)
+    # Load the parent model to pass to verification execution
+    parent_model = ModelWrapper(parent)
+
+    # Reshape the input/output to match the model
+    inp = inp.reshape(parent_model.get_tensor_shape(model.graph.input[0].name))
+    out = out.reshape(parent_model.get_tensor_shape(model.graph.output[0].name))
+
+    # Execute the onnx model to collect the result
+    # context = execute_onnx(model, context, return_full_exec_context=True)
+    context = execute_parent(parent, child, inp, return_full_ctx=True)
+    # Extract the output tensor from the execution context
+    model_out = context[parent_model.graph.output[0].name]
+    # Compare input to output
+    result = {True: "SUCCESS", False: "FAIL"}[np.allclose(out, model_out)]
+    # Save the verification outputs into the configured build directory
+    verification_output = f"{cfg.output_dir}/verification_output/"
+    # Save the verification execution context
+    np.savez(f"{verification_output}/verify_rtlsim_{result}.npz", **context)
+    # Return the original, unmodified model
+    return original
