@@ -34,6 +34,30 @@ def act_quantizer(bits, _signed=True):
     return Quantizer
 
 
+# Derives a weight quantizer from the brevitas bases leaving bit-width and
+# signedness configurable
+def weight_quantizer(bits, _signed=True):
+    # Brevitas quantizer base classes
+    from brevitas.quant.base import NarrowIntQuant, MaxStatsScaling
+    from brevitas.quant.solver import WeightQuantSolver
+    from brevitas.inject.enum import RestrictValueType
+
+    # Derive a Quantizer from the brevitas bases
+    class Quantizer(NarrowIntQuant, MaxStatsScaling, WeightQuantSolver):
+        # Configure the quantization bit-width
+        bit_width = bits
+        # Signedness of the quantization output
+        signed = _signed
+        # Per tensor quantization, not per channel
+        scaling_per_output_channel = False
+        # What is this? Copied from PerTensorFloatScaling*
+        #   Probably restricts the scale to be floating-point?
+        restrict_scaling_type = RestrictValueType.FP
+
+    # Return the derived quantizer configuration
+    return Quantizer
+
+
 # Registry of activations functions
 _registry = {}
 

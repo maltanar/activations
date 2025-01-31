@@ -95,12 +95,12 @@ from finn.util.test import execute_parent
 # Custom transformation for exhaustively composing transformations
 from custom.composed_transformation import ComposedTransformation
 # # Custom conversion from Quant to MultiThreshold
-from quant_activation_to_multithreshold import (
-    QuantActivationToMultiThreshold
-)
+from quant_to_multithreshold import QuantToMultiThreshold
 # Custom st of streamlining transformations
 from custom.streamline import Streamline, MoveMulPastAdd
 
+# New Range Analysis based streamlining directly implemented in QONNX
+from qonnx.transformation.streamline import Streamline as QONNXStreamline
 
 # Prepares the graph to be consumed by FINN:
 # 1. Some graph cleanup removing unused tensors, nodes without effect and
@@ -169,10 +169,15 @@ def prepare_graph(range_info: RangeInfo):
             verify_step(
                 model, cfg, "lowered_python", need_parent=False
             )
+
+        # Try the new QONNX Range Analysis based Streamlining to move scales and
+        # biases already to their final place where they could be fused into
+        # multi-thresholds
+        model = model.transform(QONNXStreamline(range_info))
         # Apply the quantizer to MultiThreshold conversion
         # Note: This is exhaustive as well as single .transform reapplies as
         # long as possible.
-        model = model.transform(QuantActivationToMultiThreshold(range_info))
+        model = model.transform(QuantToMultiThreshold(range_info))
         # If configured, run a verification of the transformed model on some
         # sample inputs
         if (VerificationStepType.QONNX_TO_FINN_PYTHON in

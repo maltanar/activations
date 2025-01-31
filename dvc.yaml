@@ -41,7 +41,7 @@ stages:
       - build.py
       # The custom build steps implemented in this package
       - build_steps.py
-      - quant_activation_to_multithreshold.py
+      - quant_to_multithreshold.py
       - utils.py
       # Implementation details of the new custom build steps
       - custom/apply_config.py

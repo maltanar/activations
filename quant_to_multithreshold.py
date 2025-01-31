@@ -1,7 +1,12 @@
 # Python warning messages
 import warnings
+# Proper copies of python objects
+import copy
 # Numpy for handling tensors (inputs, outputs, initializers, thresholds, ...)
 import numpy as np
+# 1d convolution to detect edges (actually image derivative)
+from scipy.ndimage import convolve1d
+
 # QONNX wrapper of ONNX model graphs
 from qonnx.core.modelwrapper import ModelWrapper
 # Converts ONNX graph nodes to QONNX custom-ops instances if possible
@@ -16,6 +21,7 @@ from qonnx.transformation.fold_constants import FoldConstants
 from qonnx.transformation.quant_constant_folding import \
     FoldTransposeIntoQuantInit
 from finn.transformation.qonnx.fold_quant_weights import FoldQuantWeights
+from qonnx.transformation.remove import RemoveIdentityOps
 
 # Range analysis to generate input ranges and scales use to enumerate inputs and
 # outputs of quantized activation functions to generate thresholds
@@ -26,7 +32,7 @@ from qonnx.core.onnx_exec import execute_node
 from qonnx.util.onnx import valueinfo_to_tensor
 
 # Protobuf onnx graph node type
-from onnx import NodeProto, TensorProto
+from onnx import NodeProto, TensorProto, TensorShapeProto
 # Helper for assembling ONNX nodes, tensors and graphs
 from onnx import helper as oh
 
@@ -73,21 +79,52 @@ FUSIBLE_OPS = {
 }
 
 
+# Tests whether two shapes can be broadcast according to NumPy semantics
+def can_broadcast_shapes(lhs, rhs):
+    # Broadcasting might raise an exception
+    try:
+        # Try broadcasting the shapes
+        if len(np.broadcast_shapes(lhs, rhs)) == max(len(lhs), len(rhs)):
+            # These tensors can be broadcast, preserving the
+            # left-hand-side shape
+            return True
+        # These tensors cannot be broadcast
+        return False
+    # Failing to broadcast the tensors raises ValueError
+    except ValueError:
+        # These tensors cannot be broadcast
+        return False
+
+
 # Extracts the complete subgraph chain of fusible elementwise operations
 # leading up to a quantizer
-def extract_quant_fusible_subgraph(node: NodeProto, model: ModelWrapper):
+def extract_quant_fusible_subgraph(
+        node: NodeProto, model: ModelWrapper, cdim: int = -1
+):
     # Checks whether an operation can be fused into the quantization operation
     # when converting to thresholds
     def is_fusible(n: NodeProto):
-        # Reject the first node of the graph for now... enable later...
-        if not model.find_direct_predecessors(n):
-            return False
         # Overall the subgraph must produce the same shape as it consumes at the
         # input as the single fused operator will not reshape or broadcast, thus
         # we should not include such operations for now
         if (model.get_tensor_shape(n.input[0]) != model.get_tensor_shape(
                 node.output[0])):
             return False
+        # If this is one of the supported monotonic elementwise operations, we
+        # need to make sure these are either per tensor or per channel as the
+        # thresholding does currently not support any grouping, tiling or
+        # whatever...
+        if n.op_type in SUPPORTED_MONOTONIC_ELTWISE:
+            # This only applies if there even is a parameter tensor
+            if init := model.get_initializer(n.input[1]):
+                # Per-tensor or per-channel means we have some parameter tensor
+                # which can be broadcast to the channel dimension of the output
+                if not can_broadcast_shapes(
+                        init.shape,
+                        (model.get_tensor_shape(node.output[0])[cdim],)
+                ):
+                    # Not-fusible...
+                    return False
         # We can fuse quantizer into quantizers, monotonic activations and
         # monotonic elementwise operations
         if n.op_type in FUSIBLE_OPS:
@@ -120,18 +157,36 @@ def extract_quant_fusible_subgraph(node: NodeProto, model: ModelWrapper):
 
 
 # Executes a subgraph given as a list (chain, i.e., non-branching) of onnx nodes
-def evaluate_subgraph(subgraph: list[NodeProto], model: ModelWrapper, x):
-    # Creates a tensor according to the value info
-    def tensor_placeholder(name):
-        # If the tensor has some initializer fill with constant parameter
-        if (init := model.get_initializer(name)) is not None:
-            return init
-        # If there is no initializers we need some placeholder for dynamic
-        # inputs and outputs
-        return valueinfo_to_tensor(model.get_tensor_valueinfo(name))
+#   Note: "Costly" version evaluating the whole input x in one pass
+def _evaluate_subgraph(subgraph: list[NodeProto], model: ModelWrapper, x):
+    # Operate on a deep copy of the model as we are going to mess with the graph
+    # value-info
+    model = copy.deepcopy(model)
 
     # Names of all tensors produced or consumed by any operation in the subgraph
     tensors = set([x for node in subgraph for x in [*node.input, *node.output]])
+
+    # Insert correctly sized batch dimension
+    batch_dim = TensorShapeProto.Dimension()
+    batch_dim.dim_value = x.shape[0]
+
+    # Add a batch dimension to all connecting tensors, scalar parameters should
+    # be broadcastable
+    for name in tensors:
+        vi = model.get_tensor_valueinfo(name)
+        # Do not touch initializer, these should be broadcastable
+        if model.get_initializer(name) is None:
+            vi.type.tensor_type.shape.dim.insert(0, batch_dim)
+
+    # Creates a tensor according to the value info
+    def tensor_placeholder(tensor_name):
+        # If the tensor has some initializer fill with constant parameter
+        if (init := model.get_initializer(tensor_name)) is not None:
+            return init
+        # If there is no initializers we need some placeholder for dynamic
+        # inputs and outputs
+        return valueinfo_to_tensor(model.get_tensor_valueinfo(tensor_name))
+
     # Prepare the execution context with placeholder for all tensors relevant to
     # the subgraph
     ctx = {**{name: tensor_placeholder(name) for name in tensors}}  # noqa: dict
@@ -148,8 +203,22 @@ def evaluate_subgraph(subgraph: list[NodeProto], model: ModelWrapper, x):
     return ctx[subgraph[-1].output[0]]
 
 
+# Executes a subgraph given as a list (chain, i.e., non-branching) of onnx nodes
+# Note: Chunking along the batch dimension to avoid excessive memory utilization
+# for intermediate tensors...
+def evaluate_subgraph(subgraph: list[NodeProto], model: ModelWrapper, x):
+    # Split into chunks along the batch: Trade off memory utilization (to hold
+    # the full execution context while evaluating) vs. execution time
+    chunks = np.array_split(x, 32, axis=0)  # TODO: Make batch size configurable
+    # Evaluate the subgraph for each chunk
+    chunks = [_evaluate_subgraph(subgraph, model, x=x) for x in chunks]
+    # Put the result back together along the batch dimension so the caller does
+    # not even notice we did a chunked processing
+    return np.concatenate(chunks, axis=0)
+
+
 # Converts supported quantized activation functions to MultiThreshold
-class QuantActivationToMultiThreshold(Transformation):
+class QuantToMultiThreshold(Transformation):
     # TODO: Add configuration options setting the fall-back step size "dx" for
     #  enumerating non-integer input ranges and limiting the maximum output
     #  bit-width of quantizers to be considered, i.e., FINN's
@@ -213,6 +282,36 @@ class QuantActivationToMultiThreshold(Transformation):
         # Note: Reversed as we are anchoring at the final quantizer of a fusible
         # monotonic-activation-eltwise-quantizer chain extending upwards
         for index, node in enumerate(reversed(graph.node)):
+            # First try to consider the tensor layout of the output for
+            # determining the number of output channels
+            layout = model.get_tensor_layout(node.output[0])
+            # If there is no layout annotation, guess based on rank of the
+            # tensor
+            if layout is None:
+                # Maps tensor rank to layout annotation
+                rank_to_layout = {
+                    0: None, 1: "C", 2: "NC", 3: "NWC", 4: "NCHW"
+                }
+                # Lookup the layout required by this input shape
+                layout = rank_to_layout[
+                    len(model.get_tensor_shape(node.input[0]))
+                ]
+            # If there is a layout annotation, use this to determine the
+            # index of the channel dimension
+            if layout is not None and "C" in layout:
+                # Lookup the index in list
+                cdim = layout.index("C")
+            # If no layout has been annotated or there is no channel
+            # dimension, fall back to the previous default assumption
+            else:
+                # Assume the channels to be in axis 1
+                cdim = 1
+                # Issue a warning to the user, so they are aware of this
+                warnings.warn(
+                    f"No meaningful layout for {node.input[0]}:"
+                    f" Assuming channel dimension at index {cdim}"
+                )
+
             # Try to match a convertible subgraph of quantizers, activations and
             # monotonic operations
             subgraph = list(extract_quant_fusible_subgraph(node, model))
@@ -225,157 +324,138 @@ class QuantActivationToMultiThreshold(Transformation):
             # quantized operations
             inp, out = subgraph[0].input[0], subgraph[-1].output[0]
 
-            # Create a wrapper function for evaluating the quantized activation
-            # subgraph handling context construction and output extraction
-            def f(x):  # noqa: Shadows x from below, is ok
-                return evaluate_subgraph(subgraph, model, x)
-
             # The input and output to the activation-quantizer combination must
             # be described by the range information analyzed above to be able to
             # enumerate the input/output levels for generating thresholds
             if inp in range_info and out in range_info:
-                # Conversion only applies if the input provides an integer range
-                # which can be enumerated
-                # TODO: This is not really true, currently this just prevents
-                #  excessively long runtimes for enumerating all floats...
+                # Conversion for non-integer input ranges might be slow as we
+                # kind of have to guess the right resolution to enumerate the
+                # float range which practically means sampling this with rather
+                # high resolution, like 1e-4
                 if range_info[inp].int_range is None:
-                    # Issue a warning to make the user aware of this
+                    # Better issue a warning to make the user aware of this...
                     warnings.warn(
-                        f"{self.__class__.__name__}: Skipping near match: "
+                        f"{self.__class__.__name__}: Potential slow conversion "
                         f"No input integer range info for {inp}"
                     )
-                    # Skip to the next candidate activation/quantizer
-                    continue
                 # The output is produced by a quantizer, thus we can always
                 # assume the integer range
-                y0, y1 = range_info[out].int_range
-                # Per-tensor reduction of the output range such that for each of
-                # the output channels (elements) the level have the same meaning
-                # Note: Without this we probably would have to do some
-                # per-channel or even per-element bias correction which
-                # currently is not clear how to derive.
-                # Note: This does not mean we cannot do per-channel thresholds,
-                # which is handled by different range and scale on the input
-                # side of the function, i.e., range_info[inp].
-                y0 = np.full_like(y0, y0.min())
-                y1 = np.full_like(y1, y1.max())
-                # Get the scale and bias for converting the integer ranges
-                # at the input and output to floats
-                scale = range_info[out].scale
-                bias = range_info[out].bias
-                # Start enumerating the threshold levels at the lower bound
-                # of the output range
-                level = y0
-                # Collect all thresholds as a list
-                thresholds = []
-                # Input range minimum and maximum serve as initial
-                # values for the interval bounds
-                (x, x1), dx = range_info[inp].range, range_info[inp].scale
-                # If the input range does not have a know scale for
-                # enumerating the thresholds, set some default
-                # Note: Uses half the quantization scale as the step size
-                # TODO: Make this configurable
-                dx = 1e-3 if dx is None else 0.5 * dx
-                # Enumerate the output levels, each will yield a set of
-                # thresholds covering all dimensions
-                while np.any(level < y1):
-                    # Evaluate the objective function "f(x) <= level" once
-                    # before entering the loop
-                    fx = f(x) <= (scale * level - bias)
-                    # Run over all input levels
-                    while np.any(fx) and np.any(x <= x1):
-                        # Evaluate the objective function "f(x) <= level" at
-                        # the current candidate input
-                        fx = f(x) <= (scale * level - bias)
-                        # Advance those inputs which are below the output
-                        # level to the next position
-                        x = np.where(fx, x + dx, x)
-                        # Sanitize x to match the input quantization levels
-                        # according to the scale or step size dx
-                        # Note: This accounts for floating-point
-                        # inaccuracies due to repeated addition of +dx
-                        x = np.round(x / dx) * dx
-                        # Clip at the upper bound of the input range
-                        # Note: Could be omitted here as this would be done by
-                        # later round and clip thresholds transformation
-                        x = np.where(x >= x1, x1, x)
-                        # Check whether the last step hits or exceeds the
-                        # quantization levels
-                        if np.all(x[fx] >= x1[fx]):
-                            # Exit here to not end up in an infinite loop
-                            # TODO: Not sure whether this is really necessary
-                            #  are already covered by the loop condition
-                            break
-                    # The thresholds for the level are now stored in x
-                    # Note: The actual threshold is halfway between this and
-                    # the previous step, i.e., -0.5 * dx
-                    thresholds.append(x - 0.5 * dx)
-                    # Move to the next output level along all dimensions and
-                    # clip values at the maximum of the range per dimension
-                    level = np.where(level >= y1, y1, level + 1)
+                (__, __), dy = range_info[out].range, range_info[out].scale
+                # Input range minimum and maximum serve as initial values for
+                # the interval bounds
+                (x0, x1), dx = range_info[inp].range, range_info[inp].scale
+
+                # Broadcast the input to the expected input shape: This allows
+                # to simplify the input range annotation for global graph inputs
+                x0 = np.broadcast_to(x0, model.get_tensor_shape(inp))
+                x1 = np.broadcast_to(x1, model.get_tensor_shape(inp))
+
+                # If the input range does not have a know scale for enumerating
+                # the inputs, set some default. Sample at a higher rate
+                # necessary aliasing and rounding effects.
+                # Note: Strictly, the sampling theorem does not apply here: This
+                # is neither band-limited (perfect steps require infinite
+                # frequencies) nor continuous (floats are not reals)
+                dx = 0.0625 * (2.5e-4 if dx is None else np.asarray(dx).min())
+                # Derive the number of, i.e., sample rate, from the input scale
+                # and range information
+                steps = int(np.round((x1.max() - x0.min())) / dx)
+                # Sample the whole input range to evaluate the entire subgraph
+                # in batch mode
+                xs = np.linspace(x0, x1, steps, dtype=np.float32)
+                # Evaluate the subgraph over the whole input range in batch mode
+                ys = evaluate_subgraph(subgraph, model, xs)
+                # We do not handle reversed indexing here
+                cdim = ys.ndim + cdim if cdim < 0 else cdim + 1
+                # Reduces the function output over all but the batch and channel
+                # axes
+                axis = tuple(i for i in range(ys.ndim) if i not in {0, cdim})
+                # Minimum per-channel reduction keeping the batch size
+                ys = np.min(ys, axis)
+                # Compute the derivative of the quantized function interpreting
+                # it as a 1d image
+                edges = convolve1d(
+                    ys, np.array([+1, -1]), axis=0, origin=-1, mode="nearest"
+                )
+                # The thresholds are the xs corresponding to the edges, i.e.,
+                # where the convolution detected a step
+                thresholds = xs[np.unique(np.where(edges)[0])]
+                # Step sizes at each of the detected thresholds, these should be
+                # integer multiples of the quantization scale
+                weights = edges[np.unique(np.where(edges)[0])]
 
                 # Get the quantizer node terminating the chain of operators as
                 # this holds some extra information such as the target bit-width
                 quant = subgraph[-1]
                 # Get the output bit-with to be produced by the quantizer,
                 # which determines how many thresholds are needed
-                # TODO: Add BipolarQuant currently still missing full RA
-                #  support
-                # TODO: BipolarQuant implicitly has bits = 1 without
-                #  initializer tensor
                 bits = int(model.get_initializer(quant.input[3]))
-                # Need to pad the thresholds such that there are 2^bits - 1
-                padding = 2 ** bits - 1 - len(thresholds)
-                # Get the lower bound of the input range
-                min_inp = range_info[inp].range[0]
-                # Fill up thresholds from the left repeating the lower bound
-                # of the input range as smallest threshold
-                thresholds = [*(padding * [min_inp]), *thresholds]
 
-                # First try to consider the tensor layout of the output for
-                # determining the number of output channels
-                layout = model.get_tensor_layout(quant.output[0])
-                # If there is no layout annotation, guess based on rank of the
-                # tensor
-                if layout is None:
-                    # Maps tensor rank to layout annotation
-                    rank_to_layout = {
-                        0: None, 1: "C", 2: "NC", 3: "NWC", 4: "NCHW"
-                    }
-                    # Lookup the layout required by this input shape
-                    layout = rank_to_layout[len(model.get_tensor_shape(inp))]
-                # If there is a layout annotation, use this to determine the
-                # index of the channel dimension
-                if layout is not None and "C" in layout:
-                    # Lookup the index in list
-                    cdim = layout.index("C")
-                # If no layout has been annotated or there is no channel
-                # dimension, fall back to the previous default assumption
-                else:
-                    # Assume the channels to be in axis 1
-                    cdim = 1
-                    # Issue a warning to the user, so they are aware of this
-                    warnings.warn(
-                        f"No meaningful layout for {inp}:"
-                        f" Assuming channel dimension at index {cdim}"
-                    )
+                # Move the first axis to the end to have (..., Num) layout,
+                # where Num is the number of thresholds found
+                thresholds = np.moveaxis(thresholds, 0, -1)
+                weights = np.moveaxis(weights, 0, -1)
+                # Force the threshold tensor to (C, Num) shape
+                # Note could be (1, 1, ..., 1, C, Num) shape before
+                thresholds = thresholds.reshape(*thresholds.shape[-2:])
+                weights = weights.reshape(*weights.shape[-2:])
 
-                # Stack thresholds list into the thresholds tensor along the
-                # final dimension, i.e., steps last
-                thresholds = np.stack(thresholds, axis=-1)
-                # Rearrange the stacked thresholds to (..., C, Num) layout
-                thresholds = thresholds.swapaxes(cdim, -2)
-                # Reduce the collected thresholds along all but the final
-                # channel dimension, assuming channel last layout here
-                # Note: Reduces over the ... part of the (..., C, Num) layout
-                # TODO: Is reducing by "min" the correct approach?
-                #  Probably: If we would reduce first, i.e., all input, output
-                #  levels, scales and biases before searching the per-element
-                #  thresholds, <= would always yield the smallest, i.e., min, x
-                #  for the corresponding output level y.
-                thresholds = np.min(
-                    thresholds, axis=tuple(range(thresholds.ndim - 2))
+                # Factor out the quantization scale from the weights, turning
+                # them into integer step sizes
+                weights = np.round(weights / dy).astype(np.int32)
+
+                # Count how many thresholds there are per channel (counting both
+                # positive and negative directions) to find out how many are
+                # missing
+                padding = 2 ** bits - 1 - np.sum(weights, axis=-1)
+                # Add back the dimension lost by reducing to be compatible with
+                # the (C, N) layout
+                padding = np.expand_dims(padding, axis=-1)
+                # warnings.warn(f"{padding=}")
+                # Add padding weights from the left to shift the function
+                # upwards
+                weights = np.concatenate((padding, weights), axis=-1)
+                # Add padding weights from the left to shift the function
+                # upwards
+                thresholds = np.concatenate(
+                    (np.full_like(padding, -np.inf), thresholds), axis=-1
                 )
+
+                # Steps of size >1 should be expressed as repeated steps of
+                # size =1 to comply with the hardware backend
+                # Unpacks a list of weights to unit weights yielding the same
+                # sum
+                def unpack_weights(ws):
+                    # Keep the sign of the weight but repeat as many 1s
+                    return [
+                        np.sign(w) * 1 for w in ws for _ in range(np.abs(w))
+                    ]
+
+                # Unpacks the threshold list according to the weights repeating
+                # the thresholds weight-many times
+                def unpack_thresholds(ts, ws):
+                    # Repeat the threshold t w-many times
+                    return [
+                        t for t, w in zip(ts, ws) for _ in range(np.abs(w))
+                    ]
+
+                # Unpack the thresholds to unit steps
+                thresholds = np.asarray([
+                    unpack_thresholds(*tws) for tws in zip(thresholds, weights)
+                ])
+                # Unpack the weight list to unit step weights
+                weights = np.asarray([unpack_weights(ws) for ws in weights])
+
+                # Sanity check for monotonicity: Non-monotonic functions have
+                # some negative weights
+                if np.any(weights < 0.0):
+                    # Issue a warning to make the user aware of this
+                    warnings.warn(
+                        f"{self.__class__.__name__}: Skipping near match: "
+                        f"Non-monotonic function near {quant.name}"
+                    )
+                    # Skip to the next candidate activation/quantizer
+                    continue
 
                 # Create new value information for the thresholds tensor
                 threshold_tensor = oh.make_tensor_value_info(
@@ -425,12 +505,12 @@ class QuantActivationToMultiThreshold(Transformation):
                     # Container type is float
                     TensorProto.FLOAT,
                     # Get the tensor shape from the numpy array
-                    scale.shape
+                    dy.shape
                 )
                 # Insert the output scale tensor information into the graph
                 graph.value_info.append(scale_tensor)
                 # Insert the scale as initializer into the graph
-                model.set_initializer(scale_tensor.name, scale)
+                model.set_initializer(scale_tensor.name, dy)
                 # Create a Mul node taking the scale factor for converting
                 # the quantized output back to floating-point
                 mul = oh.make_node(
@@ -450,12 +530,12 @@ class QuantActivationToMultiThreshold(Transformation):
                     # Container type is float
                     TensorProto.FLOAT,
                     # Get the tensor shape from the numpy array
-                    bias.shape
+                    range_info[out].bias.shape
                 )
                 # Insert the output bias tensor information into the graph
                 graph.value_info.append(bias_tensor)
                 # Insert the scale as initializer into the graph
-                model.set_initializer(bias_tensor.name, bias)
+                model.set_initializer(bias_tensor.name, range_info[out].bias)
                 # Create an Add node taking the bias for converting the
                 # quantized output back to floating-point
                 add = oh.make_node(
@@ -484,9 +564,13 @@ class QuantActivationToMultiThreshold(Transformation):
                 # nodes and tensors, break her to do cleanup and redo
                 # annotations
                 break
-        # Redo datatype and shape annotations
+        # Redo datatype and shape annotations as we have just remove and added
+        # nodes as well as connecting and parameter tensors
         model = model.transform(InferShapes())
         model = model.transform(InferDataTypes())
+        # Remove potential unit scale and zero bias inserted following the
+        # thresholds
+        model = model.transform(RemoveIdentityOps())
         # Return the transformed model and indicate whether the transformation
         # needs to be applied again
         return model, graph_modified

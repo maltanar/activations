@@ -43,6 +43,10 @@ def dummy(activation: str, input_bits: int, bits: int, pattern: str, **kwargs):
             # Note: ReLU needs to be unsigned as outputs are >= 0
             act_quant=act_quantizer(input_bits, _signed=True),
         ),
+        # We need to put something here to break the fusible chain to not
+        # collapse all of our test model into a single threshold operation as
+        # FINN currently cannot handle float thresholds
+        OperatorTemplate("x.reshape((1, *x.shape)).reshape(x.shape)"),
         # Add some generic test-pattern template in front of the activation
         # function: This should be a chain of fusible operations
         OperatorTemplate(pattern),

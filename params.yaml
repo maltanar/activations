@@ -4,9 +4,9 @@ tag: ''
 # Global seed to make evaluation reproducible
 seed: 12
 # Number of calibration passes to be applied to the model before export
-calibration_passes: 8192
+calibration_passes: 2048
 # Shape of the inputs (excluding the batch dimension)
-shape: [ 4096 ]
+shape: [ 64 ]
 # Range of input values
 range: [ -10, +10 ]
 # Model configuration section

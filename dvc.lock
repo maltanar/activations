@@ -5,19 +5,19 @@ stages:
     deps:
     - path: activations.py
       hash: md5
-      md5: 28246c1ccb588272fad4f8fd0be6913f
-      size: 31671
+      md5: bcf513ff0887998f933d0bd60dc4eadd
+      size: 32641
     - path: export.py
       hash: md5
-      md5: 8f27c5fe66f96e34574819ca23ab7842
-      size: 4049
+      md5: 607fada95e5923a106fbd4275c4eac74
+      size: 4328
     - path: utils.py
       hash: md5
       md5: f84dabfd10a04e1bb70b41d6be638042
       size: 381
     params:
       params.yaml:
-        calibration_passes: 8192
+        calibration_passes: 2048
         export:
           opset_version: 14
           do_constant_folding: true
@@ -31,20 +31,20 @@ stages:
         - 10
         seed: 12
         shape:
-        - 4096
+        - 64
     outs:
     - path: inp.npy
       hash: md5
-      md5: f1ed8d4a25875d440da47fa480f84ebf
-      size: 16512
+      md5: 5ca29830c87ab684c213b86a745cffeb
+      size: 384
     - path: model.onnx
       hash: md5
-      md5: ea4c4bc62c47576a4660f0c0d8c1e35b
-      size: 1694
+      md5: 0e2b41c8182518b3675602908b47265d
+      size: 2011
     - path: out.npy
       hash: md5
-      md5: ec05311de86d387dd8d2ab2618515e51
-      size: 16512
+      md5: daf0eb48d77b82d6747380804b99c9b4
+      size: 384
   build:
     cmd: bash run.sh '$FINN/run-docker.sh build_custom $(pwd)'
     deps:
@@ -54,8 +54,8 @@ stages:
       size: 5887
     - path: build_steps.py
       hash: md5
-      md5: cbca2f72661566dea67d7ccad5e7d61c
-      size: 18391
+      md5: bafe63c06da25900824aef4861154162
+      size: 18743
     - path: custom/apply_config.py
       hash: md5
       md5: 4c907c16f9d3e2f5377e36f153af40b8
@@ -70,24 +70,24 @@ stages:
       size: 27155
     - path: inp.npy
       hash: md5
-      md5: f1ed8d4a25875d440da47fa480f84ebf
-      size: 16512
+      md5: 5ca29830c87ab684c213b86a745cffeb
+      size: 384
     - path: model.onnx
       hash: md5
-      md5: ea4c4bc62c47576a4660f0c0d8c1e35b
-      size: 1694
+      md5: 0e2b41c8182518b3675602908b47265d
+      size: 2011
     - path: noctua.sh
       hash: md5
       md5: f3e8cc342b63cddcd2e07bfe63f6518c
       size: 1832
     - path: out.npy
       hash: md5
-      md5: ec05311de86d387dd8d2ab2618515e51
-      size: 16512
-    - path: quant_activation_to_multithreshold.py
+      md5: daf0eb48d77b82d6747380804b99c9b4
+      size: 384
+    - path: quant_to_multithreshold.py
       hash: md5
-      md5: 6e0dce7a376ee3e5bb29dfc264c33c33
-      size: 24910
+      md5: 490ac5d34e6884499a25c1a5517328d5
+      size: 28062
     - path: run.sh
       hash: md5
       md5: 6e3e34149c16795c5a8424a51bdbf5f8
@@ -112,7 +112,7 @@ stages:
           split_large_fifos: true
         seed: 12
         shape:
-        - 4096
+        - 64
       folding.yaml:
         defaults:
           Thresholding_hls:
@@ -136,16 +136,16 @@ stages:
     outs:
     - path: build/
       hash: md5
-      md5: 560f4895d9b49af2d19f0b15bcc43f85.dir
-      size: 272280983
+      md5: 699b12121b07920525b9962a1994524b.dir
+      size: 75267114
       nfiles: 137
   verify:
     cmd: python -m verify
     deps:
     - path: build/verification_output/
       hash: md5
-      md5: 987ee8050cd15fea3307b60c4b526823.dir
-      size: 46872594
+      md5: 177bd7fa22072fda8dc46c662a608be8.dir
+      size: 1360240
       nfiles: 8
     - path: verify.py
       hash: md5
@@ -164,13 +164,13 @@ stages:
     deps:
     - path: build/
       hash: md5
-      md5: 560f4895d9b49af2d19f0b15bcc43f85.dir
-      size: 272280983
+      md5: 699b12121b07920525b9962a1994524b.dir
+      size: 75267114
       nfiles: 137
     - path: build/report/post_synth_resources.json
       hash: md5
-      md5: 7d8701d37d7bc032a9e3683093575a9e
-      size: 988
+      md5: 589c7d6a7149bae1c5af8a101ca351e0
+      size: 981
     - path: metrics.py
       hash: md5
       md5: 027dcb70a77c34f84948bc3d5ee2107f
@@ -184,5 +184,5 @@ stages:
     outs:
     - path: metrics.yaml
       hash: md5
-      md5: 94bb95c9b112f3bd4e321452c9677eae
-      size: 70
+      md5: 9980f60e12da474c1faae66061f91ba9
+      size: 68
