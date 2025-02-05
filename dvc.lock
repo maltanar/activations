@@ -54,20 +54,12 @@ stages:
       size: 5887
     - path: build_steps.py
       hash: md5
-      md5: bafe63c06da25900824aef4861154162
-      size: 18743
+      md5: 8b952befa5bd0194408bb47b24082bc2
+      size: 18899
     - path: custom/apply_config.py
       hash: md5
       md5: 4c907c16f9d3e2f5377e36f153af40b8
       size: 2360
-    - path: custom/composed_transformation.py
-      hash: md5
-      md5: b77d9e6dd01758cdacc6599b54324d50
-      size: 3118
-    - path: custom/streamline.py
-      hash: md5
-      md5: 60f6f60ed63b8e80f47a5012ab80006b
-      size: 27155
     - path: inp.npy
       hash: md5
       md5: 5ca29830c87ab684c213b86a745cffeb
@@ -136,8 +128,8 @@ stages:
     outs:
     - path: build/
       hash: md5
-      md5: 699b12121b07920525b9962a1994524b.dir
-      size: 75267114
+      md5: 514d8af45e6934aee1b1cd5af93184fe.dir
+      size: 75267083
       nfiles: 137
   verify:
     cmd: python -m verify
@@ -164,8 +156,8 @@ stages:
     deps:
     - path: build/
       hash: md5
-      md5: 699b12121b07920525b9962a1994524b.dir
-      size: 75267114
+      md5: 514d8af45e6934aee1b1cd5af93184fe.dir
+      size: 75267083
       nfiles: 137
     - path: build/report/post_synth_resources.json
       hash: md5

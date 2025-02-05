@@ -92,15 +92,21 @@ from finn.transformation.fpgadataflow.prepare_rtlsim import PrepareRTLSim
 # Execute onnx model graphs from the dataflow parent for verification
 from finn.util.test import execute_parent
 
-# Custom transformation for exhaustively composing transformations
-from custom.composed_transformation import ComposedTransformation
-# # Custom conversion from Quant to MultiThreshold
-from quant_to_multithreshold import QuantToMultiThreshold
+# Transformation for exhaustively composing transformations
+from qonnx.transformation.composed import ComposedTransformation
+
+# FINN streamlining transformations reordering the graph
+from finn.transformation.streamline.reorder import MoveMulPastAdd
 # Custom st of streamlining transformations
-from custom.streamline import Streamline, MoveMulPastAdd
+from finn.transformation.streamline.streamline_plus import \
+    StreamlinePlus as Streamline
 
 # New Range Analysis based streamlining directly implemented in QONNX
 from qonnx.transformation.streamline import Streamline as QONNXStreamline
+
+# # Custom conversion from Quant to MultiThreshold
+from quant_to_multithreshold import QuantToMultiThreshold
+
 
 # Prepares the graph to be consumed by FINN:
 # 1. Some graph cleanup removing unused tensors, nodes without effect and
@@ -280,6 +286,7 @@ def step_replicate_streams(model: ModelWrapper, _):
 
 # Transformation apply the new YAML-based configuration to the model
 from custom.apply_config import ApplyConfig
+
 
 # Custom step applying our custom format of folding configuration to the graph
 def step_apply_folding_config(model: ModelWrapper, cfg: DataflowBuildConfig):
