@@ -99,8 +99,10 @@ def can_broadcast_shapes(lhs, rhs):
 # Extracts the complete subgraph chain of fusible elementwise operations
 # leading up to a quantizer
 def extract_quant_fusible_subgraph(
-        node: NodeProto, model: ModelWrapper, cdim: int = -1
+        node: NodeProto, model: ModelWrapper, cdim: int = -1, quant_filter = None
 ):
+    if quant_filter is None:
+        quant_filter = (lambda node: True)
     # Checks whether an operation can be fused into the quantization operation
     # when converting to thresholds
     def is_fusible(n: NodeProto):
@@ -134,7 +136,7 @@ def extract_quant_fusible_subgraph(
         return False
 
     # We must start on some supported quantization operation
-    if node.op_type in SUPPORTED_QUANTIZERS:
+    if node.op_type in SUPPORTED_QUANTIZERS and quant_filter(node):
         # We already know the quantizer has one actual, i.e., non-parameter,
         # input for which we want to track the producer chain
         quant_inp = node.input[0]
@@ -219,14 +221,10 @@ def evaluate_subgraph(subgraph: list[NodeProto], model: ModelWrapper, x):
 
 # Converts supported quantized activation functions to MultiThreshold
 class QuantToMultiThreshold(Transformation):
-    # TODO: Add configuration options setting the fall-back step size "dx" for
-    #  enumerating non-integer input ranges and limiting the maximum output
-    #  bit-width of quantizers to be considered, i.e., FINN's
-    #  max_multithreshold_bit_width setting.
 
     # Initializes the conversion by setting a seed range information for the
     # range analysis pass
-    def __init__(self, range_info: RangeInfo = None, assume_c_last=False, enum_rescale = 0.0625):
+    def __init__(self, range_info: RangeInfo = None, assume_c_last=False, enum_rescale = 0.0625, quant_filter = None):
         # Initialize the Transformation super class
         super().__init__()
         # Store the seed range information
@@ -236,6 +234,9 @@ class QuantToMultiThreshold(Transformation):
         # TODO: Currently not used...
         self.assume_c_last = assume_c_last
         self.enum_rescale = enum_rescale
+        # filter function to control which quantizers are converted to thresholds
+        # None means no additional filter
+        self.quant_filter = quant_filter
 
     # Applies the transform to a whole model graph
     def apply(self, model: ModelWrapper):  # noqa
@@ -315,7 +316,7 @@ class QuantToMultiThreshold(Transformation):
 
             # Try to match a convertible subgraph of quantizers, activations and
             # monotonic operations
-            subgraph = list(extract_quant_fusible_subgraph(node, model))
+            subgraph = list(extract_quant_fusible_subgraph(node, model, quant_filter=self.quant_filter))
             # Skip if no quantizer is present
             if not subgraph:
                 # Softly skip without warning, transformation just does not
