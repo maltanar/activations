@@ -102,7 +102,7 @@ def extract_quant_fusible_subgraph(
         node: NodeProto, model: ModelWrapper, cdim: int = -1, quant_filter = None
 ):
     if quant_filter is None:
-        quant_filter = (lambda node: True)
+        quant_filter = (lambda model, node: True)
     # Checks whether an operation can be fused into the quantization operation
     # when converting to thresholds
     def is_fusible(n: NodeProto):
@@ -136,7 +136,7 @@ def extract_quant_fusible_subgraph(
         return False
 
     # We must start on some supported quantization operation
-    if node.op_type in SUPPORTED_QUANTIZERS and quant_filter(node):
+    if node.op_type in SUPPORTED_QUANTIZERS and quant_filter(model, node):
         # We already know the quantizer has one actual, i.e., non-parameter,
         # input for which we want to track the producer chain
         quant_inp = node.input[0]
