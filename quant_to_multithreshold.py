@@ -231,12 +231,8 @@ class QuantToMultiThreshold(Transformation):
     # Initializes the conversion by setting a seed range information for the
     # range analysis pass
     def __init__(self, range_info: RangeInfo = None, enum_rescale=0.0625,
-<<<<<<< HEAD
-                 quant_filter=None, max_steps_for_conversion=default_max_steps_for_conversion):
-=======
                  quant_filter=None,
                  max_steps_for_conversion=default_max_steps_for_conversion):
->>>>>>> 1ed2657f6010bea4b261751fde367f5bc40998af
         # Initialize the Transformation super class
         super().__init__()
         # Store the seed range information
@@ -387,19 +383,12 @@ class QuantToMultiThreshold(Transformation):
                 # Derive the number of, i.e., sample rate, from the input scale
                 # and range information
                 steps = int(np.round((x1.max() - x0.min())) / dx)
-<<<<<<< HEAD
-                if steps > self.max_steps_for_conversion:
-                    warnings.warn(
-                        f"{self.__class__.__name__}: Skipping threshold conversion: "
-                        f"{inp} has too wide range: f{steps} > f{self.max_steps_for_conversion}"
-=======
                 # TODO: Too many steps cause excessive memory utilization...
                 if steps > self.max_steps_for_conversion:
                     warnings.warn(
                         f"{self.__class__.__name__}: Skipping conversion: "
                         f"{inp} has too wide range: f{steps} >"
                         f" f{self.max_steps_for_conversion}"
->>>>>>> 1ed2657f6010bea4b261751fde367f5bc40998af
                     )
                     continue
                 # Sample the whole input range to evaluate the entire subgraph
