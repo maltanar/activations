@@ -196,7 +196,7 @@ def _evaluate_subgraph(subgraph: list[NodeProto], model: ModelWrapper, x):
     ctx = {**{name: tensor_placeholder(name) for name in tensors}}  # noqa: dict
     # Insert the input to the subgraph which must be the first input to the
     # first operator
-    ctx[subgraph[0].input[0]] = x
+    ctx[subgraph[0].input[0]] = x.astype(np.float32)
 
     # Execute all nodes in the subgraph in order, updating the execution context
     # after each step
@@ -223,15 +223,49 @@ def evaluate_subgraph(subgraph: list[NodeProto], model: ModelWrapper, x):
 
 # how many steps (samples) we allow at most for threshold conversion
 # 8 GB memory / 8 bytes per sample (since linspace internally uses float64)
-default_max_steps_for_conversion = (8 * (2 ** 30)) / 8  
+default_max_steps_for_conversion = (8 * (2 ** 30)) / 8
+
 
 # Converts supported quantized activation functions to MultiThreshold
 class QuantToMultiThreshold(Transformation):
+    # Filter to reject the global input quantizer from conversion...
+    @staticmethod
+    def reject_input_quant(model: ModelWrapper, node: NodeProto):
+        # If node is not a quantizer, reject it...
+        if not node.op_type in SUPPORTED_QUANTIZERS:
+            return False
+        # Get the names of all global input tensors to insert a Squeeze
+        # operation in front
+        global_inputs = [inp.name for inp in model.graph.input]
+        # Check whether any of the input is a global input
+        if any(inp in global_inputs for inp in node.input):
+            # Reject quantizers directly connected to a global input
+            return False
+        # Look for another quantizer preceding this quantizer somewhere upstream
+        n = model.find_upstream(node.input[0], lambda x: x.op_type == "Quant")
+        # If there is no quantizer upstream, the list n will be empty
+        return bool(n)
+
+    # Filter to reject quantizers with too many bits
+    @staticmethod
+    def reject_bit_width(bits: int):
+        # The actual filter function...
+        def _filter(model: ModelWrapper, node: NodeProto):
+            # If node is not a quantizer, reject it...
+            if not node.op_type in SUPPORTED_QUANTIZERS:
+                return False
+            # Check whether the quantizer represents the output with too many
+            # bits
+            return int(model.get_initializer(node.input[3])) < bits
+
+        # Return the filter function
+        return _filter
 
     # Initializes the conversion by setting a seed range information for the
     # range analysis pass
     def __init__(self, range_info: RangeInfo = None, enum_rescale=0.0625,
                  quant_filter=None,
+                 assume_monotonic=False,
                  max_steps_for_conversion=default_max_steps_for_conversion):
         # Initialize the Transformation super class
         super().__init__()
@@ -247,7 +281,9 @@ class QuantToMultiThreshold(Transformation):
         self.max_steps_for_conversion = max_steps_for_conversion
         # keep a copy of the range analysis result to allow later inspection
         self.range_analysis_result = None
-
+        # Assume conversion of monotonic function which allows faster and less
+        # memory hungry threshold search
+        self.assume_monotonic = assume_monotonic
 
     # Applies the transform to a whole model graph
     def apply(self, model: ModelWrapper):  # noqa
@@ -377,41 +413,141 @@ class QuantToMultiThreshold(Transformation):
                 x1 = np.max(x1, axis)
 
                 # If the input range does not have a know scale for enumerating
-                # the inputs, set some default. Sample at a higher rate
-                # necessary aliasing and rounding effects.
-                # Note: Strictly, the sampling theorem does not apply here: This
-                # is neither band-limited (perfect steps require infinite
-                # frequencies) nor continuous (floats are not reals)
-                dx = self.enum_rescale * (
-                    2.5e-4 if dx is None else np.asarray(dx).min())
-                # Derive the number of, i.e., sample rate, from the input scale
-                # and range information
-                steps = int(np.round((x1.max() - x0.min())) / dx)
-                # TODO: Too many steps cause excessive memory utilization...
-                if steps > self.max_steps_for_conversion:
-                    warnings.warn(
-                        f"{self.__class__.__name__}: Skipping conversion: "
-                        f"{inp} has too wide range: f{steps} >"
-                        f" f{self.max_steps_for_conversion}"
-                    )
-                    continue
-                # Sample the whole input range to evaluate the entire subgraph
-                # in batch mode
-                xs = np.linspace(x0, x1, steps, dtype=np.float32)
-                # Evaluate the subgraph over the whole input range in batch mode
-                ys = evaluate_subgraph(subgraph, model, xs)
+                # the inputs, set some default. Sample at higher rate to avoid
+                # aliasing and rounding effects. Strictly, the sampling theorem
+                # does not apply here: This is neither band-limited (perfect
+                # steps require infinite frequencies) nor continuous (floats are
+                # not reals)
+                dx = 2.5e-4 if dx is None else np.min(np.asarray(dx))
+                # It does not make sense to go below the smallest representable
+                # floating-point number...
+                dx = max(self.enum_rescale * dx, np.finfo(np.float32).eps)
 
-                # Compute the derivative of the quantized function interpreting
-                # it as a 1d image
-                edges = convolve1d(
-                    ys, np.array([+1, -1]), axis=0, origin=0, mode="nearest"
-                )
-                # The thresholds are the xs corresponding to the edges, i.e.,
-                # where the convolution detected a step
-                thresholds = xs[np.unique(np.where(edges)[0])]
-                # Step sizes at each of the detected thresholds, these should be
-                # integer multiples of the quantization scale
-                weights = edges[np.unique(np.where(edges)[0])]
+                # If we assume the function to be monotonic, we can exploit this
+                # property to quickly reduce the candidate ranges for thresholds
+                # by iterated interval halving, i.e., binary search
+                if self.assume_monotonic:
+                    # Evaluate the subgraph on the bounds of the input range to
+                    # derive an estimate(?) of the number of thresholds expected
+                    y0, y1 = evaluate_subgraph(subgraph, model, [x0, x1])
+                    # The initial range covered by the functions and the number
+                    # of thresholds expected in this range
+                    ranges = [(x0, x1, y0, y1, np.max((y1 - y0) / dy))]
+                    # Enumerate the tree search branches according to branching
+                    # factor of 256: Setting this factor to two yields binary
+                    # search, but we can speed up the search by evaluating more.
+                    # TODO: Make this configurable or dependent on the number of
+                    #  channels?
+                    branches = np.expand_dims(1 / 256 * np.arange(1, 256), -1)
+                    # Keep going until each candidate range is either empty or
+                    # converged to exactly a single threshold
+                    while True:
+                        # Get the next candidate range to be refined
+                        x0, x1, y0, y1, num = ranges.pop(0)
+                        # If there is more than one threshold expected in this
+                        # range, we can further refine it
+                        if num != 0:
+                            # Cut the range into sections according to the
+                            # branches generated above
+                            xm = x0 + branches * (x1 - x0)
+
+                            # Evaluate the subgraph on the bounds of these new
+                            # ranges. _evaluate_subgraph is non-batched...
+                            ym = _evaluate_subgraph(subgraph, model, xm)
+
+                            # Insert the old bounds back into the ranges
+                            xm = np.asarray([x0, *xm, x1])
+                            ym = np.asarray([y0, *ym, y1])
+
+                            # Iterators on the ranges pairing up the upper/lower
+                            # bounds
+                            xs = zip(xm, xm[1:])
+                            ys = zip(ym, ym[1:])
+
+                            # Check each of the new ranges for potentially
+                            # containing thresholds
+                            for (x0, x1), (y0, y1) in zip(xs, ys):
+                                # We already assumed monotonicity, if this
+                                # happens it must be some float artifact...
+                                if np.any(y0 > y1):
+                                    # If it is an artifact, we can safely ignore
+                                    # if not, verification will fail anyway, as
+                                    # we are probably trying to convert a
+                                    # non-monotonic function...
+                                    continue
+                                # Keep this only if there is at least on step in
+                                # any of the axes
+                                if np.any(y0 != y1):
+                                    ranges.append(
+                                        (x0, x1, y0, y1, np.max((y1 - y0) / dy))
+                                    )
+                            # Stop if each range is smaller than the annotated
+                            # resolution - there should not be any  thresholds
+                            # at finer granularity
+                            if all(np.all(x1 - x0 <= dx) for x0, x1, *_ in
+                                   ranges):
+                                break
+
+                    # Weed out all empty threshold ranges: There should not be
+                    # any as we already test for this prior to inserting ranges
+                    # above, but just to be sure...
+                    ranges = [(*xys, num) for *xys, num in ranges if num != 0]
+
+                    # Collect thresholds and weights from the candidate ranges
+                    thresholds = [(x0 + x1) / 2 for x0, x1, *_ in ranges]
+                    weights = [(y1 - y0) / dy for *_, y0, y1, _ in ranges]
+                    # Turn threshold and weight lists into numpy arrays as
+                    # expected by the post-processing
+                    thresholds = np.asarray(thresholds, dtype=np.float32)
+                    weights = np.asarray(weights, dtype=np.float32)
+
+                    # Stack all function output values on the left side of their
+                    # range into an array
+                    ys = np.asarray([r[2] for r in ranges])
+
+                    # Look for unique output values - as we assumed the function
+                    # to be monotonic and filtered out all ranges without steps,
+                    # the same output should appear twice...
+                    _, idx = np.unique(ys, return_index=True, axis=0)
+
+                    # Keep only the unique, i.e., first, occurrence of each
+                    # threshold
+                    thresholds = thresholds[idx]
+                    weights = weights[idx]
+                # If we do not assume the function to be monotonic, we have to
+                # check each of the input steps exhaustively...
+                else:
+                    # Derive the number of, i.e., sample rate, from the input
+                    # scale and range information
+                    steps = int(np.round((x1.max() - x0.min())) / dx)
+
+                    # TODO: Too many steps cause excessive memory utilization...
+                    if steps > self.max_steps_for_conversion:
+                        warnings.warn(
+                            f"{self.__class__.__name__}: Skipping conversion: "
+                            f"{inp} has too wide range: f{steps} >"
+                            f" f{self.max_steps_for_conversion}"
+                        )
+                        continue
+
+                    # Sample the whole input range to evaluate the entire
+                    # subgraph in batch mode
+                    xs = np.linspace(x0, x1, steps, dtype=np.float32)
+                    # Evaluate the subgraph over the whole input range in batch
+                    # mode
+                    ys = evaluate_subgraph(subgraph, model, xs)
+
+                    # Derivative of the quantized function interpreting it as a
+                    # 1d image
+                    edges = convolve1d(
+                        ys, np.array([+1, -1]), axis=0, origin=0, mode="nearest"
+                    )
+                    # Thresholds are the xs corresponding to the edges, i.e.,
+                    # where the convolution detected a step
+                    thresholds = xs[np.unique(np.where(edges)[0])]
+                    # Step sizes at each of the detected thresholds, these
+                    # should be integer multiples of the quantization scale
+                    weights = edges[np.unique(np.where(edges)[0])]
 
                 # Get the quantizer node terminating the chain of operators as
                 # this holds some extra information such as the target bit-width
